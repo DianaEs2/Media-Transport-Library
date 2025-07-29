@@ -48,6 +48,13 @@ static int rx_st20p_query_ext_frame(void* priv, struct st_ext_frame* ext_frame,
   ext_frame->addr[0] = s->ext_frames[i].buf_addr;
   ext_frame->iova[0] = s->ext_frames[i].buf_iova;
   ext_frame->size = s->ext_frames[i].buf_len;
+  uint8_t planes = st_frame_fmt_planes(meta->fmt);
+  for (int plane = 0; plane < planes; plane++) {
+    ext_frame->linesize[plane] = st_frame_least_linesize(meta->fmt, meta->width, plane);
+    if (plane > 0)
+      ext_frame->addr[plane] =
+          ext_frame->addr[plane - 1] + ext_frame->linesize[plane - 1] * meta->height;
+  }
 
   /* save your private data here get it from st_frame.opaque */
   /* ext_frame->opaque = ?; */
@@ -117,6 +124,8 @@ static void rx_st20p_consume_frame(struct rx_st20p_sample_ctx* s,
     }
   */
   s->fb_recv++;
+  info("%s(%d), frame %d status %d tmsp %" PRIu64 "\n", __func__, s->idx, s->fb_recv,
+       frame->status, frame->timestamp);
 }
 
 static void* rx_st20p_frame_thread(void* arg) {
@@ -188,6 +197,16 @@ int main(int argc, char** argv) {
     snprintf(ops_rx.port.port[MTL_SESSION_PORT_P], MTL_PORT_MAX_LEN, "%s",
              ctx.param.port[MTL_PORT_P]);
     ops_rx.port.udp_port[MTL_SESSION_PORT_P] = ctx.udp_port + i * 2;
+
+    if (ctx.param.port[MTL_PORT_R]) {
+      memcpy(ops_rx.port.ip_addr[MTL_SESSION_PORT_R], ctx.rx_ip_addr[MTL_PORT_R],
+             MTL_IP_ADDR_LEN);
+      snprintf(ops_rx.port.port[MTL_SESSION_PORT_R], MTL_PORT_MAX_LEN, "%s",
+               ctx.param.port[MTL_PORT_R]);
+      ops_rx.port.udp_port[MTL_SESSION_PORT_R]  //= ctx.udp_port + i * 2;
+          = 20000;                              // TODO remove
+    }
+
     ops_rx.port.payload_type = ctx.payload_type;
     ops_rx.width = ctx.width;
     ops_rx.height = ctx.height;
@@ -199,12 +218,18 @@ int main(int argc, char** argv) {
     ops_rx.framebuff_cnt = app[i]->fb_cnt;
     ops_rx.notify_frame_available = rx_st20p_frame_available;
 
-    if (equal) {
+    if (equal || ctx.ext_frame) {
       /* no convert, use ext frame for example */
       app[i]->ext_frames =
           (struct st20_ext_frame*)malloc(sizeof(*app[i]->ext_frames) * app[i]->fb_cnt);
       size_t framebuff_size =
           st20_frame_size(ops_rx.transport_fmt, ops_rx.width, ops_rx.height);
+      size_t framebuff_size_2 =
+          st20_frame_size(ST20_FMT_YUV_422_PLANAR10LE, ops_rx.width, ops_rx.height);
+
+      if (framebuff_size_2 > framebuff_size)
+        framebuff_size = framebuff_size_2;
+          
       size_t fb_size = framebuff_size * app[i]->fb_cnt;
       /* alloc enough memory to hold framebuffers and map to iova */
       mtl_dma_mem_handle dma_mem = mtl_dma_mem_alloc(ctx.st, fb_size);
@@ -225,6 +250,7 @@ int main(int argc, char** argv) {
       /* use dynamic external frames */
       ops_rx.query_ext_frame = rx_st20p_query_ext_frame;
       ops_rx.flags |= ST20P_RX_FLAG_RECEIVE_INCOMPLETE_FRAME;
+      ops_rx.flags |= ST20P_RX_FLAG_EXT_FRAME;
     }
 
     st20p_rx_handle rx_handle = st20p_rx_create(ctx.st, &ops_rx);
